@@ -174,10 +174,30 @@ names and wording, and scores your 3 points only.
 > to students: this is your report, see the homework description.
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+I chose Fisher’s points 1, 2 and 5 to answer three questions. How quickly have sales grown? How much of current revenue comes from newer products? How much operating profit does the company keep from each dollar of sales? For each point, I assign `PASS` when the company’s metric equals or exceeds its own industry median and `FAIL` when it falls below. I use the industry recorded in `company` to select the benchmark from `industry_medians`.
+
+| Fisher point | Why I chose it | Evidence and calculation |
+|---|---|---|
+| **1. Market potential** | Two years of realized sales growth provide an observable indicator of demand for the company’s products. | I sum order amounts in `orders` for FY2023 and FY2025. Cumulative growth is `100 × (FY2025 revenue / FY2023 revenue − 1)`. I compare it with `revenue_growth_2y_pct`. |
+| **2. New product development** | Sales can grow even when a company still relies on older products. The share of sales from recent launches shows whether newer products have begun to contribute. | I use `products.launch_date` to identify products launched in 2023–2025, then use `orders` to calculate their share of FY2025 revenue. I compare that percentage with `new_product_share_pct`. |
+| **5. Profit margin** | Revenue growth alone says little about how much profit a company earns on its sales. | Using FY2025 revenue from `orders` and expenses from `monthly_costs`, I calculate `100 × (revenue − cost of sales − selling and administrative expenses − R&D) / revenue`. I compare the result with `operating_margin_pct`. |
+
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A["sql_query for one company"] --> B["Calculate the three metrics"]
+    B --> C["Compare each metric with its industry median"]
+    C -->|Verdicts| E["results.csv"]
+    C -->|Metrics, medians and verdicts| D["DeepSeek writes the summary"]
+    D -->|Summary| E
+```
+
+All three points use database evidence, so the agent calls the provided `sql_query` tool once per company. SQL compares the underlying values before the tool rounds them for display. A LangChain prompt then passes the metrics, benchmarks and verdicts to `deepseek-v4-flash` to explain the results in two or three sentences. If the model call fails, the agent retains the verdicts and uses the verified figures as its summary.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+Across 20 companies in `public_test`, all **60 of 60 verdicts** matched `ground_truth.json`. The agent correctly identified **42 of 42 true passes** and **18 of 18 true fails**, giving a **balanced point score of 100.0%**. There were no company-level disagreements to explain.
+
+Ashgrove Labs shows why I included both growth and product renewal. Its two-year sales growth was **24.92%** against an industry median of **21.70%**, so point 1 passed. Recent launches accounted for **22.93%** of sales against a median of **29.20%**, so point 2 failed despite the company’s strong overall growth. Its operating margin of **13.36%** exceeded the industry median of **9.40%**, so point 5 passed.
