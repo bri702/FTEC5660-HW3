@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import csv
 import json
+import sys
 import sqlite3
 import threading
 import zlib
@@ -57,60 +58,115 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 2, 5]
+
+METRIC_NAMES = {
+    1: "FY2023–FY2025 cumulative sales growth",
+    2: "FY2025 sales share from products launched in 2023–2025",
+    5: "FY2025 operating margin",
+}
+
+# Compare before sql_query rounds its displayed percentages to two decimals.
+FISHER_SQL = """
+WITH sales AS (
+    SELECT
+        SUM(CASE WHEN order_date < '2024-01-01' THEN amount END) AS revenue_2023,
+        SUM(CASE WHEN order_date >= '2025-01-01' THEN amount END) AS revenue_2025,
+        SUM(CASE WHEN order_date >= '2025-01-01' AND product IN (
+            SELECT product FROM products
+            WHERE launch_date >= '2023-01-01' AND launch_date < '2026-01-01'
+        ) THEN amount ELSE 0 END) AS new_product_revenue
+    FROM orders
+    WHERE order_date >= '2023-01-01' AND order_date < '2026-01-01'
+),
+costs AS (
+    SELECT SUM(cost_of_sales + selling_admin + research_development) AS operating_costs
+    FROM monthly_costs
+    WHERE month >= '2025-01' AND month < '2026-01'
+),
+industry AS (
+    SELECT m.* FROM industry_medians AS m JOIN company AS c ON c.industry = m.industry
+),
+metrics(point, actual, median) AS (
+    SELECT 1, 100.0 * (revenue_2025 - revenue_2023) / NULLIF(revenue_2023, 0),
+           revenue_growth_2y_pct FROM sales CROSS JOIN industry
+    UNION ALL
+    SELECT 2, 100.0 * new_product_revenue / NULLIF(revenue_2025, 0),
+           new_product_share_pct FROM sales CROSS JOIN industry
+    UNION ALL
+    SELECT 5, 100.0 * (revenue_2025 - operating_costs) / NULLIF(revenue_2025, 0),
+           operating_margin_pct FROM sales CROSS JOIN costs CROSS JOIN industry
+)
+SELECT point, actual, median, CASE WHEN actual >= median THEN 'PASS' ELSE 'FAIL' END AS verdict
+FROM metrics WHERE actual IS NOT NULL AND median IS NOT NULL ORDER BY point
+"""
 
 
+
+
+    ### YOUR CODE HERE
 def build_agent() -> Any:
-    """Create and return your model or agent once.
+    """Build one LangChain summary chain shared by all companies."""
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
 
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Explain the supplied Fisher verdicts in two or three concise English sentences. "
+                   "Cover all three metrics. Keep each percentage, industry comparison and verdict "
+                   "consistent with the evidence. Do not speculate or give investment advice."),
+        ("human", "Company: {company}\nEvidence verified by SQL:\n{evidence}"),
+    ])
+    model = ChatDeepSeek(model=MODEL_NAME, temperature=0, timeout=30, max_retries=1,
+                         max_tokens=300, extra_body={"thinking": {"type": "disabled"}})
+    return prompt | model | StrOutputParser()
 
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
-    """
+
+
+
     ### YOUR CODE HERE
-    return None
-
-
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
-    """Run your agent and return its verdicts on CHOSEN_POINTS for every company.
+    """Fetch evidence with each company's SQL tool and explain the comparisons."""
+    limit = asyncio.Semaphore(4)
 
-    ``companies`` maps each company folder name to its four LangChain tools:
+    async def analyze_one(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with limit:
+            points = {}
+            evidence = []
+            try:
+                sql_tool = next(tool for tool in tools if tool.name == "sql_query")
+                table = await sql_tool.ainvoke({"query": FISHER_SQL})
+                header, *rows = table.splitlines()
+                if header != "point | actual | median | verdict":
+                    raise ValueError("SQL returned no metric table")
 
-        list_documents()             names and dates of the company's documents
-        read_document(name)          the text of one document
-        sql_query(query)             one read-only SQLite query on company.db
-        interview(role, topic)       one interview answer (INTERVIEW_LIMIT per company)
+                for row in rows:
+                    if row == "(no rows)":
+                        continue
+                    number, actual, median, verdict = row.split(" | ")
+                    point = int(number)
+                    points[point] = verdict
+                    evidence.append(f"{METRIC_NAMES[point]} was {actual}% against an industry median "
+                                    f"of {median}% (point {point}: {verdict}).")
+            except Exception as exc:
+                print(f"{name}: could not read all SQL evidence ({type(exc).__name__}).", file=sys.stderr)
 
-    Give the tools to a tool-calling agent, e.g.
-    ``create_agent(model, tools=companies[name], system_prompt=...)``, or call
-    them yourself with ``tool.invoke({...})``. The README explains the
-    documents, the database tables and the interview roles and topics.
+            missing = [str(point) for point in CHOSEN_POINTS if point not in points]
+            if missing:
+                evidence.append(f"Insufficient SQL evidence for point(s) {', '.join(missing)}.")
 
-    Return one dictionary per company folder name, e.g. with
-    CHOSEN_POINTS = [1, 7, 15]:
+            summary = " ".join(evidence)
+            if agent is not None and not missing:
+                try:
+                    response = await agent.ainvoke({"company": name, "evidence": summary})
+                    summary = response.strip() or summary
+                except Exception as exc:
+                    print(f"{name}: model summary unavailable ({type(exc).__name__}); "
+                          "using verified SQL evidence.", file=sys.stderr)
 
-        {
-            "hollins_group": {
-                "points": {1: "PASS", 7: "FAIL", 15: "PASS"},
-                "summary": "Two or three sentences explaining the verdicts.",
-            },
-            ...
-        }
+            return name, {"points": points, "summary": summary}
 
-    Each chosen point needs a verdict ("PASS" or "FAIL"; True/False also
-    works). Other points are ignored.
-
-    Catch errors per company (e.g. a failed API call) and still return an
-    entry for it: an exception here means no results.csv, which scores zero.
-    You may analyse companies in parallel (e.g. ``asyncio.gather``).
-    """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    return dict(await asyncio.gather(*(analyze_one(name, tools) for name, tools in companies.items())))
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
